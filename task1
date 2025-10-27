@@ -1,0 +1,337 @@
+// file_manager.cpp
+// Simple interactive file management tool using C++17 std::filesystem
+// Build: g++ -std=c++17 file_manager.cpp -o file_manager
+
+#include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
+
+namespace fs = std::filesystem;
+
+using std::cout;
+using std::cin;
+using std::endl;
+using std::string;
+
+static void print_header() {
+    cout << "=== Simple File Management Tool ===\n";
+    cout << "Type 'help' to see available commands.\n\n";
+}
+
+static void show_help() {
+    cout <<
+    "Commands:\n"
+    "  ls [path] [-r]             List directory contents (use -r for recursive)\n"
+    "  info <path>                Show info about file or directory\n"
+    "  touch <path>               Create empty file (like touch)\n"
+    "  mkdir <path>               Create directory (creates parents)\n"
+    "  rm <path> [-r]             Delete file or directory (-r recursive for dirs)\n"
+    "  mv <src> <dst>             Move or rename\n"
+    "  cp <src> <dst> [-r]        Copy file or directory (-r for recursive)\n"
+    "  read <file> [lines]        Print first N lines of file (default 50)\n"
+    "  append <file>              Append text (end with a single '.' on a line)\n"
+    "  find <path> <pattern>      Search for names containing pattern\n"
+    "  pwd                        Print current working directory\n"
+    "  cd <path>                  Change directory\n"
+    "  help                       Show this help\n"
+    "  exit                       Quit\n\n"
+    "Notes:\n"
+    "  - Paths may be absolute or relative. Use quotes if spaces exist.\n"
+    "  - Be careful: rm is destructive. Use -r to delete non-empty directories.\n";
+}
+
+static void print_file_time(const fs::file_time_type &ft) {
+    using namespace std::chrono;
+    auto sctp = time_point_cast<system_clock::duration>(ft - fs::file_time_type::clock::now()
+               + system_clock::now());
+    std::time_t cftime = system_clock::to_time_t(sctp);
+    cout << std::put_time(std::localtime(&cftime), "%F %T");
+}
+
+static void cmd_ls(const std::vector<string>& args) {
+    bool recursive = false;
+    fs::path p = ".";
+    if (args.size() >= 2) p = args[1];
+    if (args.size() >= 3 && args[2] == "-r") recursive = true;
+    try {
+        if (!fs::exists(p)) { cout << "Path does not exist: " << p << "\n"; return; }
+        if (fs::is_regular_file(p)) {
+            cout << p.filename().string() << " (file)\n";
+            return;
+        }
+        if (!recursive) {
+            for (auto &entry : fs::directory_iterator(p)) {
+                auto f = entry.path();
+                cout << (fs::is_directory(f) ? "[D] " : "[F] ") << f.filename().string() << "\n";
+            }
+        } else {
+            for (auto &entry : fs::recursive_directory_iterator(p)) {
+                auto f = entry.path();
+                std::string indent;
+                for (size_t i = 0; i < std::distance(p.begin(), f.parent_path().begin()); ++i) indent += "  ";
+                cout << (fs::is_directory(f) ? "[D] " : "[F] ") << f.string() << "\n";
+            }
+        }
+    } catch (const std::exception &e) {
+        cout << "Error listing: " << e.what() << "\n";
+    }
+}
+
+static void cmd_info(const std::vector<string>& args) {
+    if (args.size() < 2) { cout << "usage: info <path>\n"; return; }
+    fs::path p = args[1];
+    try {
+        if (!fs::exists(p)) { cout << "Path does not exist.\n"; return; }
+        cout << "Path: " << fs::absolute(p).string() << "\n";
+        cout << "Type: " << (fs::is_directory(p) ? "Directory" : (fs::is_regular_file(p) ? "Regular File" : "Other")) << "\n";
+        if (fs::is_regular_file(p)) {
+            cout << "Size: " << fs::file_size(p) << " bytes\n";
+        }
+        auto ftime = fs::last_write_time(p);
+        cout << "Last write: "; print_file_time(ftime); cout << "\n";
+        cout << "Permissions: " << ((fs::status(p).permissions() & fs::perms::owner_read) != fs::perms::none ? "r" : "-")
+             << ((fs::status(p).permissions() & fs::perms::owner_write) != fs::perms::none ? "w" : "-")
+             << ((fs::status(p).permissions() & fs::perms::owner_exec) != fs::perms::none ? "x" : "-") << "\n";
+    } catch (const std::exception &e) {
+        cout << "Error: " << e.what() << "\n";
+    }
+}
+
+static void cmd_touch(const std::vector<string>& args) {
+    if (args.size() < 2) { cout << "usage: touch <path>\n"; return; }
+    fs::path p = args[1];
+    try {
+        if (fs::exists(p)) {
+            // update last write time
+            std::ofstream ofs(p, std::ios::app);
+            ofs.close();
+            fs::last_write_time(p, fs::file_time_type::clock::now());
+            cout << "Touched existing: " << p << "\n";
+        } else {
+            std::ofstream ofs(p);
+            if (!ofs) cout << "Failed to create file.\n";
+            else cout << "Created: " << p << "\n";
+        }
+    } catch (const std::exception &e) {
+        cout << "Error: " << e.what() << "\n";
+    }
+}
+
+static void cmd_mkdir(const std::vector<string>& args) {
+    if (args.size() < 2) { cout << "usage: mkdir <path>\n"; return; }
+    fs::path p = args[1];
+    try {
+        if (fs::create_directories(p)) cout << "Created directory: " << p << "\n";
+        else cout << "Directory already exists or could not be created: " << p << "\n";
+    } catch (const std::exception &e) {
+        cout << "Error: " << e.what() << "\n";
+    }
+}
+
+static bool prompt_confirm(const string &msg) {
+    cout << msg << " (y/N): ";
+    string s; std::getline(cin, s);
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return (!s.empty() && (s == "y" || s == "yes"));
+}
+
+static void remove_recursive(const fs::path &p) {
+    std::error_code ec;
+    fs::remove_all(p, ec);
+    if (ec) throw std::runtime_error(ec.message());
+}
+
+static void cmd_rm(const std::vector<string>& args) {
+    if (args.size() < 2) { cout << "usage: rm <path> [-r]\n"; return; }
+    fs::path p = args[1];
+    bool recursive = (args.size() >= 3 && args[2] == "-r");
+    try {
+        if (!fs::exists(p)) { cout << "Path does not exist.\n"; return; }
+        if (fs::is_directory(p) && !recursive) {
+            cout << "Path is a directory. Use -r to delete recursively.\n"; return;
+        }
+        if (!prompt_confirm(std::string("Are you sure you want to delete '") + p.string() + "'?")) {
+            cout << "Aborted.\n"; return;
+        }
+        if (fs::is_directory(p)) {
+            remove_recursive(p);
+            cout << "Directory removed: " << p << "\n";
+        } else {
+            fs::remove(p);
+            cout << "File removed: " << p << "\n";
+        }
+    } catch (const std::exception &e) {
+        cout << "Error removing: " << e.what() << "\n";
+    }
+}
+
+static void cmd_mv(const std::vector<string>& args) {
+    if (args.size() < 3) { cout << "usage: mv <src> <dst>\n"; return; }
+    fs::path src = args[1], dst = args[2];
+    try {
+        fs::create_directories(dst.parent_path());
+        fs::rename(src, dst);
+        cout << "Moved/renamed to: " << dst << "\n";
+    } catch (const std::exception &e) {
+        cout << "Move failed: " << e.what() << "\n";
+    }
+}
+
+static void copy_recursive(const fs::path &from, const fs::path &to) {
+    if (!fs::exists(from)) throw std::runtime_error("Source does not exist.");
+    if (fs::is_regular_file(from)) {
+        fs::create_directories(to.parent_path());
+        fs::copy_file(from, to, fs::copy_options::overwrite_existing);
+        return;
+    }
+    // directory
+    for (auto &entry : fs::recursive_directory_iterator(from)) {
+        const auto rel = fs::relative(entry.path(), from);
+        const auto dest = to / rel;
+        if (fs::is_directory(entry.path())) {
+            fs::create_directories(dest);
+        } else if (fs::is_regular_file(entry.path())) {
+            fs::create_directories(dest.parent_path());
+            fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing);
+        }
+    }
+}
+
+static void cmd_cp(const std::vector<string>& args) {
+    if (args.size() < 3) { cout << "usage: cp <src> <dst> [-r]\n"; return; }
+    fs::path src = args[1], dst = args[2];
+    bool recursive = (args.size() >= 4 && args[3] == "-r");
+    try {
+        if (!fs::exists(src)) { cout << "Source does not exist.\n"; return; }
+        if (fs::is_directory(src) && !recursive) {
+            cout << "Source is directory; use -r for recursive copy.\n"; return;
+        }
+        if (fs::is_regular_file(src)) {
+            fs::create_directories(dst.parent_path());
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+            cout << "Copied file to: " << dst << "\n";
+        } else {
+            // directory
+            copy_recursive(src, dst);
+            cout << "Copied directory to: " << dst << "\n";
+        }
+    } catch (const std::exception &e) {
+        cout << "Copy failed: " << e.what() << "\n";
+    }
+}
+
+static void cmd_read(const std::vector<string>& args) {
+    if (args.size() < 2) { cout << "usage: read <file> [lines]\n"; return; }
+    fs::path f = args[1];
+    int lines = 50;
+    if (args.size() >= 3) lines = std::stoi(args[2]);
+    try {
+        if (!fs::exists(f) || !fs::is_regular_file(f)) { cout << "File not found.\n"; return; }
+        std::ifstream ifs(f);
+        string line;
+        int count = 0;
+        while (count < lines && std::getline(ifs, line)) {
+            cout << line << "\n";
+            ++count;
+        }
+        if (ifs.good() && !ifs.eof() && count >= lines) cout << "... (truncated)\n";
+    } catch (const std::exception &e) {
+        cout << "Error reading file: " << e.what() << "\n";
+    }
+}
+
+static void cmd_append(const std::vector<string>& args) {
+    if (args.size() < 2) { cout << "usage: append <file>\n"; return; }
+    fs::path f = args[1];
+    try {
+        std::ofstream ofs(f, std::ios::app);
+        if (!ofs) { cout << "Cannot open file for append.\n"; return; }
+        cout << "Enter text. End input with a single '.' on a line.\n";
+        string line;
+        while (true) {
+            std::getline(cin, line);
+            if (line == ".") break;
+            ofs << line << "\n";
+        }
+        cout << "Appended to " << f << "\n";
+    } catch (const std::exception &e) {
+        cout << "Error appending: " << e.what() << "\n";
+    }
+}
+
+static void cmd_find(const std::vector<string>& args) {
+    if (args.size() < 3) { cout << "usage: find <path> <pattern>\n"; return; }
+    fs::path base = args[1];
+    string pat = args[2];
+    try {
+        if (!fs::exists(base) || !fs::is_directory(base)) { cout << "Base path not found or not a directory.\n"; return; }
+        for (auto &entry : fs::recursive_directory_iterator(base)) {
+            if (entry.path().filename().string().find(pat) != string::npos) {
+                cout << entry.path().string() << "\n";
+            }
+        }
+    } catch (const std::exception &e) {
+        cout << "Search error: " << e.what() << "\n";
+    }
+}
+
+static void cmd_pwd() {
+    try { cout << fs::current_path().string() << "\n"; } catch (...) {}
+}
+
+static void cmd_cd(const std::vector<string>& args) {
+    if (args.size() < 2) { cout << "usage: cd <path>\n"; return; }
+    try {
+        fs::current_path(args[1]);
+        cout << "CWD: " << fs::current_path().string() << "\n";
+    } catch (const std::exception &e) {
+        cout << "cd failed: " << e.what() << "\n";
+    }
+}
+
+int main() {
+    print_header();
+    string line;
+    while (true) {
+        cout << "> ";
+        if (!std::getline(cin, line)) break;
+        // basic tokenization: split by spaces but allow quoted strings
+        std::vector<string> tokens;
+        string cur;
+        bool in_quote = false;
+        for (size_t i = 0; i < line.size(); ++i) {
+            char c = line[i];
+            if (c == '"') { in_quote = !in_quote; continue; }
+            if (!in_quote && std::isspace((unsigned char)c)) {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+            } else cur.push_back(c);
+        }
+        if (!cur.empty()) tokens.push_back(cur);
+        if (tokens.empty()) continue;
+        string cmd = tokens[0];
+        if (cmd == "help") show_help();
+        else if (cmd == "exit" || cmd == "quit") break;
+        else if (cmd == "ls") cmd_ls(tokens);
+        else if (cmd == "info") cmd_info(tokens);
+        else if (cmd == "touch") cmd_touch(tokens);
+        else if (cmd == "mkdir") cmd_mkdir(tokens);
+        else if (cmd == "rm") cmd_rm(tokens);
+        else if (cmd == "mv") cmd_mv(tokens);
+        else if (cmd == "cp") cmd_cp(tokens);
+        else if (cmd == "read") cmd_read(tokens);
+        else if (cmd == "append") cmd_append(tokens);
+        else if (cmd == "find") cmd_find(tokens);
+        else if (cmd == "pwd") cmd_pwd();
+        else if (cmd == "cd") cmd_cd(tokens);
+        else {
+            cout << "Unknown command: " << cmd << ". Type 'help' for commands.\n";
+        }
+    }
+    cout << "Bye.\n";
+    return 0;
+}
