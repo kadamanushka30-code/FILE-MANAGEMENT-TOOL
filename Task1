@@ -1,6 +1,3 @@
-// file_manager.cpp
-// Simple interactive file management tool using C++17 std::filesystem
-// Build: g++ -std=c++17 file_manager.cpp -o file_manager
 
 #include <iostream>
 #include <filesystem>
